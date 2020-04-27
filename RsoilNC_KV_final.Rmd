@@ -1,0 +1,447 @@
+---
+title: "Traitement de données issues de chambres automatiques à fermeture horizontale pour les échanges gazeux du sol (CO2, H2O, N2O, CH4) avec le logiciel R"
+author: "Créquy Nathan, Van den Meersche Karel"
+date: "27/04/2020"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+<img src="../Donnees/logo cirad.jpg" style="position:absolute;top:0px;right:0px;" width="200px"  />
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## Chargement des packages:
+library(data.table)
+library(lubridate)
+library("ggplot2")
+library("plyr")
+library(lubridate)
+Sys.setlocale("LC_TIME", "English")
+library(tidyverse)
+library(stringr)
+
+```
+
+
+# Initialisation des constantes
+```{r ini, include=TRUE}
+# Cleaning the Workspace
+Sys.setenv(TZ="GMT")
+rm(list=ls()) #cleans every object
+
+#we initialize the constant parameters
+pressure <-101300  #air pressure (Pa)
+R <- 8.3144598 # gas constant,  	m3 Pa K-1 mol-1
+chamberareas <- c(0.395, 0.355)# (m2, around 0.7 *0.5 m, area ch1, area ch2)
+chambervolumes <- c(0.063894525, 0.064725313)  #Volume Chambre 1, Chambre 2
+
+#details chamber dimensions: 
+  #ch1: 71*55*16.3611 (mean of 18 values)
+  #ch2: 71*50*18.2308 (mean of 13 values)
+#details tubing lengths (go and back chamber/ analyser, meters):
+  #ch1: chamber to solenoid valve: 33.6 + solenoid valve to analyser: 0.8 + inside the analyser: 0.5
+  #ch2: chamber to solenoid valve: 47.1 + solenoid valve to analyser: 0.8 + inside the analyser: 0.5
+#tubing radius: 0.2 mm => we multiply total tubing length by (pi*0.2?) to get the tubing volume
+```
+
+# Calcul de la respiration du sol à partir d'un fichier brut
+
+A partir d'un fichier de données brutes, c'est à dire des enregistrements de la température et de la concentration en CO2 de l'air au cours du temps, la fonction **soilrespi** renvoie un fichier .dat composé de 5 variables: le numéro de la chambre active, l'heure du début de l'enregistrement, le flux de CO2 en micromol/m²/s, la concentration initiale de l'air en CO2 (en ppm) et le R² du modèle linaire servant à calculer le flux de CO2. 
+
+```{r soilrespicomplet, include=FALSE}
+
+soilrespi<-function(file_dat){
+  dta<-fread(file_dat, skip=4, sep="auto") # read the raw data file, we skip the first 4 lines which are descriptive
+  print(file_dat)
+  colnames(dta)<-c("TIMESTAMP", "RECORD", "BattV", "TRef", "Tfield(1)", "Tfield(2)", "VW(1)", "VW(2)", "PA_uS(1)", "PA_uS(2)", "Active_Chamber", "CO2", "H2O")# we rename the rows with the 2nd line of the raw data file
+  #we need to convert the TIMESTAMP row into POSIXct format. The problem is that TIMESTAMP is not written in the same way depending on the raw data file, so we have to distinguish 4 different formats.  
+  if (substr( dta$TIMESTAMP[1],5,5)=="-"){#format: yyyy-m-dd hh:mm:ss
+    dta$TIMESTAMP<- as.POSIXct(as.character(dta$TIMESTAMP), format="%Y-%m-%d %H:%M:%S") #convert timestamp in date/hour
+    
+  }else if (substr( dta$TIMESTAMP[1],3,3)=="/" & substr( dta$TIMESTAMP[1],6,6)=="/"){ #format: dd/mm/yyyy hh:mm:ss
+    dta$TIMESTAMP<- as.POSIXct(as.character(dta$TIMESTAMP), format="%d/%m/%Y %H:%M")#convert timestamp in date/hour
+    
+  }else if (substr( dta$TIMESTAMP[1],3,3)=="/" & substr( dta$TIMESTAMP[1],5,5)=="/"){ #format: dd/mm/yy hh:mm:ss
+    dta$TIMESTAMP<- as.POSIXct(as.character(dta$TIMESTAMP), format="%d/%m/%Y %H:%M")#convert timestamp in date/hour
+    year(dta$TIMESTAMP)<-year(dta$TIMESTAMP)+2000
+    
+  }else if (substr( dta$TIMESTAMP[1],5,5)=="/" & substr( dta$TIMESTAMP[1],8,8)=="/"){ #format: yyyy/mm/dd hh:mm:ss
+    dta$TIMESTAMP<- as.POSIXct(as.character(dta$TIMESTAMP), format="%Y/%m/%d %H:%M:%S")#convert timestamp in date/hour
+  }
+  
+  #A raw data file contains numerous series of measures for each chamber at different times but nothing distinguish a serie from another in the dataset. 
+  #So, we want to build some blocs of lines, each bloc would contain one serie of measures. 
+  #We create the vectors 'opening' and 'closing' which will contain the row index of the chambers' opening/closing
+  #for example: opening=(1,335, ...) and closing=(334, 699,..) when the bloc 1 is from lines 1 to 334 and the bloc 2 from lines 335 to 699. 
+  #We complete 'opening' and 'closing' by analysing each 2 consecutive rows and noticing if there is a change of chamber or a time difference of more than 3 minutes (note that during a serie of measures, we measure the CO2 concentration each second)
+  opening<-c(1)#we initialize the opening vector with the first row index of dta
+  opening
+  closing<-c()#we create the closing vector
+  closing
+  i<-1
+  while (i<nrow(dta)) {
+    if ((dta$Active_Chamber[i]!=dta$Active_Chamber[i+1]) ||abs(difftime(dta$TIMESTAMP[i], dta$TIMESTAMP[i+1], units = "mins"))>3){
+      opening<-append(opening,(i+1))
+      closing<-append(closing,i)}
+    i<-i+1
+  }
+  closing<-append(closing,nrow(dta))## we insert the index of the last row because it is not taken in the "While" loop. 
+  
+  ##convert temperature from Celsius to Kelvin degrees
+  dta$Kelvin_Temp<-dta$TRef+273.16
+  dta$Kelvin_Temp
+  
+  ## Returning a dataframe containing the coefficients of the linear regression for each datarecord:
+  #These vectors are the future columns of the dataframe
+  coef1<-c()#coef1= 'a' of the 'ax+b' line, units=umol/m2/s=FLUX
+  CO2i<-c()#units=ppm, initial value of CO2 
+  time<-c()
+  chamber<-c()
+  Rsquared<-c()
+  #we proceed a linear regression on each serie of measures
+  for (i in 1:length(opening)){ #length(opening)= number of series of measures
+    dataselection<-dta[opening[i]:(closing[i]),]#we select a serie of measures, we skip the first 20 values because of their bad accuracy 
+    #due to the air renewal in the tubings (the values fluctuate a lot during the beginning of  CO2 air concentration measurement)
+    dataselection$seconds <-as.numeric(1:nrow(dataselection))#we add a second counter to build the linear regression
+    ##We convert CO2 concentration in ppm into umol/m?:
+    dataselection$n<-pressure*chambervolumes[dataselection$Active_Chamber[1]]/R/dataselection$Kelvin_Temp# mol_air (ideal gas law: n = pV/RT)
+    dataselection$CO2.umol.m2 <- dataselection$CO2*dataselection$n / chamberareas[dataselection$Active_Chamber[1]] # ppm * mol / m2 = umol_CO2/m2
+    if (nrow(dataselection)>50){ #we need to have more than 50 measures (or lines) in dataselection because we skip the first 20 lines 
+      #print(dataselection)
+      #print(nrow(dataselection>50))
+      #print(nrow(dataselection))
+      CO2linearregression <- lm(CO2.umol.m2~seconds,data=dataselection[20:nrow(dataselection)]) # we build a linear regression
+      coef1<-append(coef1,summary(CO2linearregression)$coef[2,1]) #coef1= 'a' of the 'ax+b' line, units=umol/m2/s=FLUX
+      CO2i<-append(CO2i,summary(CO2linearregression)$coef[1,1]*chamberareas[dataselection$Active_Chamber[1]]/mean(dataselection$n)) #summary(CO2linearregression)$coef[1,1]= 'b' of the 'ax+b' line, units=umol/m2
+      #so we multiply it by 1/n and by the chamber area to obtain ppm: (umol/m?)* (m?/mol)=umol/mol=ppm
+      Rsquared<-append(Rsquared,summary(CO2linearregression)$r.squared) #assess the quality of the regression
+      time<-append(time,dataselection$TIMESTAMP[1]) #we take the time of the beginning of the data record for each linear regression
+      chamber<-append(chamber,mean(dataselection$Active_Chamber)) #we identify the chamber (Chamber1=sun or Chamber2=shade)
+    }}
+  
+  resu<-data.frame(time=time,coef1=coef1,CO2i=CO2i,Rsquared=Rsquared,chamber=chamber) #we build the dataframe
+  write.csv(resu,file=paste("resu", basename(file_dat)), row.names=F) #we write the .dat file in the working directory
+  return(resu)}
+
+```
+
+
+## Uniformisation des heures d'enregistrement
+```{r soilrespitime, eval=FALSE}
+
+soilrespi<-function(file_dat){
+  dta<-fread(file_dat, skip=4, sep="auto") # read the raw data file, we skip the first 4 lines which are descriptive
+  print(file_dat)
+  colnames(dta)<-c("TIMESTAMP", "RECORD", "BattV", "TRef", "Tfield(1)", "Tfield(2)", "VW(1)", "VW(2)", "PA_uS(1)", "PA_uS(2)", "Active_Chamber", "CO2", "H2O")# we rename the rows with the 2nd line of the raw data file
+  #we need to convert the TIMESTAMP row into POSIXct format. The problem is that TIMESTAMP is not written in the same way depending on the raw data file, so we have to distinguish 4 different formats.  
+  if (substr( dta$TIMESTAMP[1],5,5)=="-"){#format: yyyy-m-dd hh:mm:ss
+    dta$TIMESTAMP<- as.POSIXct(as.character(dta$TIMESTAMP), format="%Y-%m-%d %H:%M:%S") #convert timestamp in date/hour
+    
+  }else if (substr( dta$TIMESTAMP[1],3,3)=="/" & substr( dta$TIMESTAMP[1],6,6)=="/"){ #format: dd/mm/yyyy hh:mm:ss
+    dta$TIMESTAMP<- as.POSIXct(as.character(dta$TIMESTAMP), format="%d/%m/%Y %H:%M")#convert timestamp in date/hour
+    
+  }else if (substr( dta$TIMESTAMP[1],3,3)=="/" & substr( dta$TIMESTAMP[1],5,5)=="/"){ #format: dd/mm/yy hh:mm:ss
+    dta$TIMESTAMP<- as.POSIXct(as.character(dta$TIMESTAMP), format="%d/%m/%Y %H:%M")#convert timestamp in date/hour
+    year(dta$TIMESTAMP)<-year(dta$TIMESTAMP)+2000
+    
+  }else if (substr( dta$TIMESTAMP[1],5,5)=="/" & substr( dta$TIMESTAMP[1],8,8)=="/"){ #format: yyyy/mm/dd hh:mm:ss
+    dta$TIMESTAMP<- as.POSIXct(as.character(dta$TIMESTAMP), format="%Y/%m/%d %H:%M:%S")#convert timestamp in date/hour
+  }
+```
+
+## Séparation de chaque série de mesures
+Un fichier brut comporte plusieurs séries de mesures pour chaque chambre au cours du temps mais rien ne distingue une série de mesure d'une autre. On cherche donc à isoler chaque enregistrement pour calculer le flux de CO2 pour chacun d'eux. 
+Tout d'abord, construisons des blocs de lignes correspondant chacun à un même enregistrement. On stocke les débuts et fins de bocs dans les vecteurs *opening* et *closing*. On distingue deux enregistrements par un changement de numéro de la chambre active ou par une différence de temps entre deux mesures consécutives de plus de 3 minutes (on note que les mesures sont prises toutes les secondes au cours d'un enregistrement). 
+
+```{r soilrespiblocs, eval=FALSE} 
+#We create the vectors 'opening' and 'closing' which will contain the row index of the chambers' opening/closing
+  #for example: opening=(1,335, ...) and closing=(334, 699,..) when the bloc 1 is from lines 1 to 334 and the bloc 2 from lines 335 to 699. 
+
+  opening<-c(1)#we initialize the opening vector with the first row index of dta
+  opening
+  closing<-c()#we create the closing vector
+  closing
+  i<-1
+  while (i<nrow(dta)) {
+    if ((dta$Active_Chamber[i]!=dta$Active_Chamber[i+1]) ||abs(difftime(dta$TIMESTAMP[i], dta$TIMESTAMP[i+1], units = "mins"))>3){ #change of chamber or a time difference of more than 3 minutes
+      opening<-append(opening,(i+1))
+      closing<-append(closing,i)}
+    i<-i+1
+  }
+  closing<-append(closing,nrow(dta))## we insert the index of the last row because it is not taken in the "While" loop. 
+  
+  ##convert temperature from Celsius to Kelvin degrees
+  dta$Kelvin_Temp<-dta$TRef+273.16
+  dta$Kelvin_Temp
+```
+
+## Calcul du flux de CO2
+On calcule le flux de CO2 et on regroupe les résultats dans le dataframe *resu* :
+```{r soilrespicalc, eval=FALSE}
+  ## Returning a dataframe containing the coefficients of the linear regression for each datarecord:
+  #These vectors are the future columns of the dataframe
+  coef1<-c()#coef1= 'a' of the 'ax+b' line, units=umol/m2/s=FLUX
+  CO2i<-c()#units=ppm, initial value of CO2 
+  time<-c()
+  chamber<-c()
+  Rsquared<-c()
+  #we proceed a linear regression on each serie of measures
+  for (i in 1:length(opening)){ #length(opening)= number of series of measures
+    dataselection<-dta[opening[i]:(closing[i]),]#we select a serie of measures, we skip the first 20 values because of their bad accuracy 
+    #due to the air renewal in the tubings (the values fluctuate a lot during the beginning of  CO2 air concentration measurement)
+    dataselection$seconds <-as.numeric(1:nrow(dataselection))#we add a second counter to build the linear regression
+    ##We convert CO2 concentration in ppm into umol/m?:
+    dataselection$n<-pressure*chambervolumes[dataselection$Active_Chamber[1]]/R/dataselection$Kelvin_Temp# mol_air (ideal gas law: n = pV/RT)
+    dataselection$CO2.umol.m2 <- dataselection$CO2*dataselection$n / chamberareas[dataselection$Active_Chamber[1]] # ppm * mol / m2 = umol_CO2/m2
+    if (nrow(dataselection)>50){ #we need to have more than 50 measures (or lines) in dataselection because we skip the first 20 lines 
+      #print(dataselection)
+      #print(nrow(dataselection>50))
+      #print(nrow(dataselection))
+      CO2linearregression <- lm(CO2.umol.m2~seconds,data=dataselection[20:nrow(dataselection)]) # we build a linear regression
+      coef1<-append(coef1,summary(CO2linearregression)$coef[2,1]) #coef1= 'a' of the 'ax+b' line, units=umol/m2/s=FLUX
+      CO2i<-append(CO2i,summary(CO2linearregression)$coef[1,1]*chamberareas[dataselection$Active_Chamber[1]]/mean(dataselection$n)) #summary(CO2linearregression)$coef[1,1]= 'b' of the 'ax+b' line, units=umol/m2
+      #so we multiply it by 1/n and by the chamber area to obtain ppm: (umol/m?)* (m?/mol)=umol/mol=ppm
+      Rsquared<-append(Rsquared,summary(CO2linearregression)$r.squared) #assess the quality of the regression
+      time<-append(time,dataselection$TIMESTAMP[1]) #we take the time of the beginning of the data record for each linear regression
+      chamber<-append(chamber,mean(dataselection$Active_Chamber)) #we identify the chamber (Chamber1=sun or Chamber2=shade)
+    }}
+  
+  resu<-data.frame(time=time,coef1=coef1,CO2i=CO2i,Rsquared=Rsquared,chamber=chamber)#we build the dataframe
+  write.csv(resu,file=paste("resu", basename(file_dat)), row.names=F) #we write the .dat file in the working directory
+  return(resu)}
+```
+
+
+# Visualisation des résultats 
+La fonction **vizualise** permet une visualisation graphique des données. Les graphiques sont sauvegardés au format *.jpeg* dans le répertoire de travail. 
+
+## Chargement des données stockées dans *fichierfinal.csv* 
+```{r visualize, eval= FALSE}
+vizualise<-function(){
+  ## Loading the data
+  data<-read.csv("../Donnees/fichierfinal.csv", header=T, sep=",")
+  data$time<- as.POSIXct(as.character(data$time), format="%Y-%m-%d %H:%M:%S")
+  data <- data[order(data$time, decreasing=FALSE),]
+  data$month<-as.factor(paste(year(data$time),"-",month(data$time)))
+  for (i in 1:nlevels(data$month)) {
+    levels(data$month)[i]<-paste(month.name[as.numeric(str_sub(as.character(levels(data$month)[i]), 8,9))], as.numeric(str_sub(as.character(levels(data$month)[i]), 1,4)))
+  }
+  data$chamber<-as.factor(data$chamber)
+```
+
+```{r datavisu, include=FALSE}
+  data<-read.csv("../Donnees/fichierfinal.csv", header=T, sep=",")
+    data$time<- as.POSIXct(as.character(data$time), format="%Y-%m-%d %H:%M:%S")
+    data <- data[order(data$time, decreasing=FALSE),]
+    data$month<-as.factor(paste(year(data$time),"-",month(data$time)))
+    for (i in 1:nlevels(data$month)) {
+      levels(data$month)[i]<-paste(month.name[as.numeric(str_sub(as.character(levels(data$month)[i]), 8,9))], as.numeric(str_sub(as.character(levels(data$month)[i]), 1,4)))
+    }
+  data$chamber<-as.factor(data$chamber)
+```
+
+## Tri des données selon le coefficient de détermination R² du modèle linéaire
+```{r visualizeRsq, include= TRUE, message= FALSE , fig.cap="Distribution du R² associé au modèle linéaire permettant la calcul de flux de CO2 pour chaque chambre"}
+
+  ## we verify the quality of the multiple regressions
+  Rsquared<-ggplot(data, aes(x = Rsquared, color=chamber==2)) +
+    stat_density(aes(group = chamber),position="identity",geom="line")+
+    scale_colour_manual("",values=c("#FFC125", "#008B45"), labels=c("Chamber 1: Sun", "Chamber 2: Shade"))+
+    labs(title='Rsoil R² distribution by chamber')+
+    theme(axis.line = element_line(colour = "black"), panel.background = element_blank())
+  plot(Rsquared)
+  
+```
+
+Désormais, les données sont triées selon la valeur du R². 
+
+```{r trie, include= TRUE}
+  #ggsave("R2 distrib   according to R2 value
+  data_sorted<-subset(data, data$Rsquared>0.85)
+```
+
+## Respiration du sol en fonction de l'exposition soleil/ombre
+```{r Rsoildecjuly, include= TRUE,  message= FALSE , fig.cap="Respiration du sol de décembre 2018 à juillet 2019 en fonction de l'exposition"}
+  ## Rsoil dec->july
+graph_sorted<-ggplot(data_sorted, aes(x=time, y=coef1))+
+    aes(color=chamber==2)+
+    scale_colour_manual("",values=c("#FFC125", "#008B45"), labels=c("Chamber 1: Sun", "Chamber 2: Shade"))+
+    labs(y=expression(paste("Rsoil"~ "(",mu,"mol"~ "m"^-2 ~ "s"^-1,")")), x="Date", title = "Rsoil dec-july R2 filtered", subtitle = "R²>0.85")+
+    ylim(-1, 5)+
+    geom_point(size=0.8)+
+    scale_x_datetime(date_labels = "%b%Y", date_breaks = "1 month")+
+    theme(axis.line = element_line(colour = "black"), axis.text.x = element_text(angle = 30, vjust = 1, hjust=1), panel.background = element_blank())
+#ggsave("Rsoil dec-july R2 filtered.png", plot = graph_sorted)
+  plot(graph_sorted)
+```
+
+```{r Rsoilbymonth, include= TRUE,  message= FALSE , fig.cap="Respiration du sol par mois en fonction de l'exposition"}
+  ## Rsoil by month a graph for each month on the same window
+  data_sorted2<-subset(data_sorted, ((data_sorted$month!="November 2018")&(data_sorted$month!="December 2018")))# we suppress november and december 2018 data
+  graph_by_month_sorted<-ggplot(data_sorted2, aes(x=time, y=coef1))+
+    aes(color=chamber==2)+
+    scale_colour_manual("",values=c("#FFC125", "#008B45"), labels=c("Chamber 1: Sun", "Chamber 2: Shade"))+
+    labs(y=expression(paste("Rsoil"~ "(",mu,"mol"~ "m"^-2 ~ "s"^-1,")")), x="Date", title = "Rsoil by month R2 filtered", subtitle = "R²>0.85")+
+    geom_point(size=0.8)+
+    ylim(-1,5)+
+    facet_wrap(~month, scales = ("free_x"), ncol=4)+
+    scale_x_datetime(date_labels = "%d")+
+    theme(axis.line = element_line(colour = "black"), axis.text.x = element_text(vjust = 1, hjust=1), panel.background = element_blank(), strip.background = element_rect(
+  color="black", fill="#C1FFC1", size=1.5, linetype="solid"
+))
+  #ggsave("Rsoil by month R2 filtered.png", plot = graph_by_month_sorted)
+  plot(graph_by_month_sorted)
+```
+
+## Concentration de l'air en CO2 au niveau de l'interface sol-atmosphère
+```{r COibymonth, include= TRUE,  message= FALSE , fig.cap="Concentration de l'air en CO2 à l'interface sol-atmosphère"}
+  ##initial CO2 air concentration
+  graph_sorted<-ggplot(data_sorted, aes(x=time, y=CO2i))+
+    aes(color=chamber==2)+
+    scale_colour_manual("",values=c("#FFC125", "#008B45"), labels=c("Chamber 1: Sun", "Chamber 2: Shade"))+
+    labs(y="CO2 concentration (ppm)", x="Date", title = "Above soil CO2 air concentration", subtitle = "R²>0.85")+
+    geom_point(size=0.8)+
+    ylim(300,500)+
+    scale_x_datetime(date_labels = "%b%Y", date_breaks = "1 month")+
+    theme(axis.line = element_line(colour = "black"), axis.text.x = element_text(angle = 30, vjust = 1, hjust=1), panel.background = element_blank())
+  #ggsave("CO2 air concentration dec-july R2 0.85.png", plot = graph_sorted)
+  plot(graph_sorted)
+```
+
+## Fluctuations journalières de la respiration du sol
+```{r dielfluctuations, include= TRUE,  message= FALSE , fig.cap="Fluctuations journalières de la respiration du sol pour la chambre 1 exposée au soleil seulement"}
+  ##Rsoil diel fluctations
+  data_sorted$month<-month(data_sorted$time)
+  data_sorted$hour<-hour(data_sorted$time)
+  datach1<-subset(data_sorted, ((data_sorted$chamber==1)&(data_sorted$month!=12)&(data_sorted$month!=11))) #we suppress data during month 11 and 12 
+  
+  fun_mean<-function (x){ #calculer moyenne coef1 par heure pour chaque mois
+    resu<-tapply(x$coef1, x$hour, mean)
+    return(resu)}
+  mean_datach1=by(datach1, datach1$month, fun_mean)
+  fun_sd<-function (x){ #calculer ecart type coef1 par heure pour chaque mois
+    resu<-tapply(x$coef1, x$hour, sd)
+    return(resu)}
+  sd_datach1=by(datach1, datach1$month, fun_sd)
+  
+  a<-as.data.frame(unlist(mean_datach1))
+  colnames(a)<-c("mean_coef1")
+  sd<-as.data.frame(unlist(sd_datach1))
+  colnames(sd)<-c("sd_coef1")
+  data_plot<-cbind(a,sd)
+  for (x in 1:nrow(a)) {
+    data_plot$month[x]<-as.numeric(strsplit(names(unlist(mean_datach1)),"[.]")[[x]][1])
+    data_plot$hour[x]<-as.numeric(strsplit(names(unlist(mean_datach1)),"[.]")[[x]][2])
+  }
+  
+  data_plot$month<-as.factor(data_plot$month)
+  
+  labs=c()
+  for (i in 1:nlevels(data_plot$month)) {
+    labs<-append(labs, as.character(paste(month.name[as.numeric(levels(data_plot$month)[i])], '2019')))
+  }
+  levels(data_plot$month)<-labs
+  
+  
+  diel_fluctuations_by_month<-ggplot(data_plot, aes(x=hour, y=mean_coef1))+
+    scale_color_brewer("", palette="Set1",labels=c("Chamber 1: Sun"))+
+    labs(y=expression(paste("Rsoil"~ "(",mu,"mol"~ "m"^-2 ~ "s"^-1,")")), x="time (hours)", title = "Rsoil diel fluctuations per month (for Chamber 1 only: Full Sun)")+
+    geom_point()+
+    scale_x_continuous(breaks=seq(2, 24, by=2))+
+    geom_errorbar(data=data_plot, aes(x=hour,ymin=mean_coef1-sd_coef1, ymax=mean_coef1+ sd_coef1),width = .2, position = position_dodge(width = 1)) +
+    facet_wrap(~month, scales = 'free', ncol=4)+
+    theme(axis.line = element_line(colour = "black"), axis.text.x = element_text(angle = 30, vjust = 1, hjust=1, size=6), panel.background = element_blank(), strip.background = element_rect(
+  color="black", fill="#C1FFC1", size=1.5, linetype="solid"))
+  #ggsave("Rsoil diel fluctuations per month.png", plot = diel_fluctuations_by_month) 
+  plot(diel_fluctuations_by_month)
+```
+
+## Respiration du sol maximale journalière
+```{r maxdielRsoil, include= TRUE,  message= FALSE , fig.cap="Respiration du sol maximale journalière en fonction des mois"}
+  
+  ## MAX diel Rsoil by month 
+  data<-read.csv("../Donnees/fichierfinal.csv", header=T, sep=",")
+  data$time<- as.POSIXct(as.character(data$time), format="%Y-%m-%d %H:%M:%S")
+  data <- data[order(data$time, decreasing=FALSE),]
+  data_sorted<-subset(data, data$Rsquared>0.85)
+  data_sorted$month<-month(data_sorted$time)
+  data_sorted$time<- as.POSIXct(as.character(data_sorted$time), format="%Y-%m-%d %H:%M:%S")
+  data_sorted$day<-day(data_sorted$time)
+  fun_max<-function (x){ #calculer max coef1 par jour pour chaque mois
+    resu<-tapply(x$coef1, x$day, max)
+    return(resu)}
+  datach1<-subset(data_sorted, ((data_sorted$chamber==1)&(data_sorted$month!=12)&(data_sorted$month!=11)))
+  datach2<-subset(data_sorted, ((data_sorted$chamber==2)&(data_sorted$month!=12)&(data_sorted$month!=11)))
+  max_datach1<-by(datach1, datach1$month, fun_max)
+  max_datach2<-by(datach2, datach2$month, fun_max)
+  
+  ch1max<-as.data.frame(unlist(max_datach1))
+  colnames(ch1max)<-c("coef1max")
+  for (x in 1:nrow(ch1max)) {
+    ch1max$month[x]<-as.numeric(strsplit(names(unlist(max_datach1)),"[.]")[[x]][1])
+    ch1max$day[x]<-as.numeric(strsplit(names(unlist(max_datach1)),"[.]")[[x]][2])
+  }
+  ch1max$chamber<-1
+  ch2max<-as.data.frame(unlist(max_datach2))
+  colnames(ch2max)<-c("coef1max")
+  for (x in 1:nrow(ch2max)) {
+    ch2max$month[x]<-as.numeric(strsplit(names(unlist(max_datach2)),"[.]")[[x]][1])
+    ch2max$day[x]<-as.numeric(strsplit(names(unlist(max_datach2)),"[.]")[[x]][2])
+  }
+  ch2max$chamber<-2
+  CO2max<-rbind(ch1max,ch2max)
+  
+  CO2max$month<-as.factor(CO2max$month)
+  labs=c()
+  for (i in 1:nlevels(CO2max$month)) {
+    labs<-append(labs, as.character(paste(month.name[i], '2019')))
+  }
+  levels(CO2max$month)<-labs
+  
+  
+  maxCO2<-ggplot(CO2max, aes(x=day, y=coef1max))+
+    aes(color=chamber==2)+
+    scale_colour_manual("",values=c("#FFC125", "#008B45"), labels=c("Chamber 1: Sun", "Chamber 2: Shade"))+
+    labs(y=expression(paste("Rsoil"~ "(",mu,"mol"~ "m"^-2 ~ "s"^-1,")")), x="Date", title = "Maximum diel Rsoil by month")+
+    scale_x_continuous(breaks=seq(1,31,by=4))+
+    geom_point()+
+    ylim(0, 4)+
+    facet_wrap(~month, scales = 'free_x', ncol=4)+
+    theme(axis.line = element_line(colour = "black"), axis.text.x = element_text(size=7), panel.background = element_blank(), strip.background = element_rect(
+  color="black", fill="#C1FFC1", size=1.5, linetype="solid"
+))
+  #ggsave("max Rsoil by month.png", plot = maxCO2)
+  plot(maxCO2)
+
+```
+
+# Traitement du dernier fichier de données brutes disponible
+La fonction *treatment_last* permet de traiter le dernier fichier de données brutes disponibles. Pour cela, elle compile les nouvelles données aux données existantes et génère des graphiques en appelant la fonction *vizualise*
+
+```{r last, include=TRUE}
+treatment_last<- function(){
+  file_dat<-choose.files(caption="Select your last data file")
+  if (file.exists("fichierfinal.csv")) {
+         fichierfinal<-fread("fichierfinal.csv")
+         fichierfinal$time<-as.POSIXct(as.character(fichierfinal$time), format="%Y-%m-%d %H:%M:%S")
+         fichierfinal$chamber<-as.numeric(fichierfinal$chamber)
+         file.remove("fichierfinal.csv")
+         newfichierfinal<-rbind(fichierfinal, soilrespi(file_dat))
+  }else{
+    newfichierfinal<-soilrespi(file_dat)
+  } # end if .. else
+  newfichierfinal<-newfichierfinal[order(newfichierfinal$time, decreasing=FALSE),]
+  write.csv(newfichierfinal,file="fichierfinal.csv", row.names = F)
+  vizualise()
+} # end function treatment_last
+  
+```
+
+
+
+&nbsp;
+
+
